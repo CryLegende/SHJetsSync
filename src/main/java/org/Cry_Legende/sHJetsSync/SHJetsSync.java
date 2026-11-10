@@ -18,11 +18,10 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 /**
  * Partage le temps de jeu de JetsAntiAFKPro entre les serveurs Opale du réseau (voir config.yml).
@@ -31,13 +30,23 @@ import java.util.concurrent.TimeoutException;
  * le serveur d'arrivée pouvait lire avant l'écriture du serveur de départ et repartir de la dernière sauvegarde
  * automatique (jusqu'à 600 s plus tôt), puis l'écraser, et rejouer un palier de temps de jeu.</p>
  *
+ * <p>La connexion n'attend pas le serveur de départ : il ne sauvegarde le joueur qu'une fois cette connexion terminée
+ * (le proxy ferme l'ancienne connexion après), l'attendre bloquerait la connexion jusqu'à son expiration. La barrière
+ * de passage est suivie sans attente depuis la pré-connexion ; une fois passée, le temps est relu en base et la fiche
+ * de JetsAntiAFKPro est relevée si elle a été lue avant.</p>
+ *
  * <p>Fil principal : la table des fiches de JetsAntiAFKPro, {@code leaving}. Fil {@code SHJetsSync-db} : la base.
- * Fils de connexion de Paper : l'attente de la barrière de passage.</p>
+ * Fils de SHNetwork : fin de la barrière de passage, qui renvoie aussitôt au fil principal.</p>
  */
 public final class SHJetsSync extends JavaPlugin implements Listener {
 
     private static final int WRITE_ATTEMPTS = 3;
     private static final int CHECK_ATTEMPTS = 3;
+    private static final long ARRIVAL_KEEP_MS = 120_000L;
+
+    /** Barrière de passage d'un joueur qui se connecte, lancée à sa pré-connexion et reprise à son arrivée. */
+    private record Arrival(CompletableFuture<Boolean> saved, long at) {
+    }
 
     private JetsBridge jets;
     private PlaytimeDatabase database;
@@ -47,6 +56,8 @@ public final class SHJetsSync extends JavaPlugin implements Listener {
 
     /** Fiche de chaque joueur qui part, relevée avant que JetsAntiAFKPro ne la retire (fil principal). */
     private final Map<UUID, Object> leaving = new HashMap<>();
+    /** Barrière de chaque joueur en cours de connexion. */
+    private final Map<UUID, Arrival> arrivals = new ConcurrentHashMap<>();
 
     @Override
     public void onEnable() {
@@ -105,25 +116,25 @@ public final class SHJetsSync extends JavaPlugin implements Listener {
     // ------------------------------------------------------------------ arrivée
 
     /**
-     * Fil de connexion de Paper : le joueur n'entre qu'une fois son temps écrit par le serveur de départ.
-     * JetsAntiAFKPro, qui le lit après PlayerJoinEvent, lit donc la bonne valeur.
+     * Fil de connexion de Paper : suit la barrière de passage sans l'attendre. Le serveur de départ n'écrit le temps
+     * du joueur qu'une fois cette connexion terminée, une attente ici durerait jusqu'au délai maximal.
      */
     @EventHandler(priority = EventPriority.MONITOR)
     public void onPreLogin(AsyncPlayerPreLoginEvent event) {
         if (event.getLoginResult() != AsyncPlayerPreLoginEvent.Result.ALLOWED) {
             return;
         }
-        try {
-            Boolean saved = SHNetworkAPI.get().awaitSaved(event.getUniqueId(), Duration.ofSeconds(waitSeconds))
-                .get(waitSeconds + 2L, TimeUnit.SECONDS);
-            if (!Boolean.TRUE.equals(saved)) {
-                getLogger().warning("Départ de " + event.getName() + " non confirmé par l'autre serveur : JetsAntiAFKPro lira la base telle quelle.");
+        long now = System.currentTimeMillis();
+        arrivals.values().removeIf(arrival -> now - arrival.at() > ARRIVAL_KEEP_MS);
+        String name = event.getName();
+        CompletableFuture<Boolean> saved = SHNetworkAPI.get().awaitSaved(event.getUniqueId(), Duration.ofSeconds(waitSeconds));
+        saved.whenComplete((ok, error) -> {
+            if (error != null || !Boolean.TRUE.equals(ok)) {
+                getLogger().warning("Départ de " + name + " non confirmé par l'autre serveur"
+                    + (error != null ? " (" + error + ")" : "") + " : JetsAntiAFKPro lira la base telle quelle.");
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        } catch (ExecutionException | TimeoutException e) {
-            getLogger().warning("Départ de " + event.getName() + " non confirmé (" + e + ") : JetsAntiAFKPro lira la base telle quelle.");
-        }
+        });
+        arrivals.put(event.getUniqueId(), new Arrival(saved, now));
     }
 
     /**
@@ -138,32 +149,46 @@ public final class SHJetsSync extends JavaPlugin implements Listener {
         if (stale != null && jets.owner(stale) != player && jets.remove(id, stale)) {
             getLogger().info("Fiche périmée de " + player.getName() + " retirée (" + jets.seconds(stale) + " s, session précédente).");
         }
-        getServer().getScheduler().runTaskLater(this, () -> verify(player, 1), checkTicks);
+        Arrival arrival = arrivals.remove(id);
+        getServer().getScheduler().runTaskLater(this, () -> verify(player, 1, false), checkTicks);
+        if (arrival != null && !arrival.saved().isDone()) {
+            // le serveur de départ n'a pas fini : JetsAntiAFKPro peut lire avant lui, le temps est relu dès qu'il a fini
+            arrival.saved().whenComplete((ok, error) -> {
+                if (isEnabled()) {
+                    getServer().getScheduler().runTask(this, () -> verify(player, 1, true));
+                }
+            });
+        }
     }
 
     /**
      * Une lecture ratée de JetsAntiAFKPro (« FAILED TO QUERY DATABASE ») laisse la fiche à -1 : rien n'est compté ni
      * sauvé pour la session. Une lecture d'une session précédente qui finit après celle-ci laisse une fiche périmée.
      * Dans les deux cas, le temps est relu ici et la fiche remplacée.
+     *
+     * <p>{@code afterDeparture} : le serveur de départ vient d'écrire le temps du joueur. JetsAntiAFKPro a pu lire
+     * avant : si sa fiche est en retard sur la base, elle est remplacée (jamais abaissée).</p>
      */
-    private void verify(Player player, int attempt) {
+    private void verify(Player player, int attempt, boolean afterDeparture) {
         if (!player.isOnline()) {
             return;
         }
         Object sheet = jets.sheet(player.getUniqueId());
         if (sheet == null) {
             if (attempt < CHECK_ATTEMPTS) {
-                getServer().getScheduler().runTaskLater(this, () -> verify(player, attempt + 1), checkTicks);
+                getServer().getScheduler().runTaskLater(this, () -> verify(player, attempt + 1, afterDeparture), checkTicks);
             }
             return;
         }
         boolean stale = jets.owner(sheet) != player;
-        if (!stale && jets.seconds(sheet) != -1) {
+        boolean failed = !stale && jets.seconds(sheet) == -1;
+        if (!stale && !failed && !afterDeparture) {
             return;
         }
         UUID id = player.getUniqueId();
         String name = player.getName();
-        String reason = stale ? "une fiche périmée" : "une lecture ratée de JetsAntiAFKPro";
+        String reason = stale ? "une fiche périmée" : failed ? "une lecture ratée de JetsAntiAFKPro"
+            : "une lecture faite avant le départ de l'autre serveur";
         io.execute(() -> {
             int seconds;
             try {
@@ -173,7 +198,11 @@ public final class SHJetsSync extends JavaPlugin implements Listener {
                 return;
             }
             getServer().getScheduler().runTask(this, () -> {
-                if (player.isOnline() && jets.replace(player, sheet, seconds)) {
+                if (!player.isOnline()) {
+                    return;
+                }
+                boolean behind = !stale && !failed && jets.seconds(sheet) < seconds;
+                if ((stale || failed || behind) && jets.replace(player, sheet, seconds)) {
                     getLogger().info("Temps de jeu de " + name + " relu après " + reason + " : " + seconds + " s.");
                 }
             });

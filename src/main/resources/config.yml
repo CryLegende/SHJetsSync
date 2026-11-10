@@ -3,8 +3,10 @@
 # Partage le temps de jeu de JetsAntiAFKPro entre les serveurs Opale reliés par SHNetwork, sans modifier JetsAntiAFKPro :
 #   - départ : le temps du joueur est écrit dans la table de JetsAntiAFKPro (player_afk_data) avant que SHNetwork
 #     annonce le joueur sauvegardé (barrière de passage) ; JetsAntiAFKPro écrit la même valeur sans l'attendre ;
-#   - arrivée : la connexion attend cette annonce, JetsAntiAFKPro lit donc la valeur écrite par le serveur de départ
-#     (sans cela, il pouvait relire la dernière sauvegarde automatique, perdre jusqu'à 10 minutes et rejouer un palier) ;
+#   - arrivée : la connexion n'attend pas cette annonce (le proxy ne ferme l'ancien serveur qu'après la connexion, l'attendre
+#     la bloquerait). Dès que le serveur de départ a écrit, le temps est relu et la fiche de JetsAntiAFKPro est relevée si
+#     elle a été lue avant (sans cela, il pouvait relire la dernière sauvegarde automatique, perdre jusqu'à 10 minutes et
+#     rejouer un palier) ;
 #   - une fiche laissée par un joueur reparti avant la fin de sa lecture est retirée à sa connexion suivante ;
 #   - une lecture ratée de JetsAntiAFKPro (« FAILED TO QUERY DATABASE », temps à -1, session ni comptée ni sauvée)
 #     est refaite par ce plugin `verification-ticks` après la connexion.
@@ -13,7 +15,8 @@
 # Ce plugin n'a ni commande ni permission. Il se pose sur tous les serveurs Opale du réseau, avec SHNetwork,
 # et seulement si JetsAntiAFKPro range le temps de jeu en MySQL (store_player_time: true, database.mysql.use: true).
 
-# Temps maximal, en secondes, pendant lequel un joueur qui arrive attend que le serveur de départ ait écrit son temps.
+# Temps maximal, en secondes, pendant lequel on attend que le serveur de départ ait écrit le temps d'un joueur qui arrive
+# (au-delà, la fiche de JetsAntiAFKPro est gardée telle quelle).
 attente-passage-secondes: 10
 
 # Délai, en ticks, entre la connexion et la vérification de la fiche de JetsAntiAFKPro (20 = une seconde).
